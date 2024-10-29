@@ -74,7 +74,7 @@ class Codebook(nn.Module):
             else self.neighbourhood_range - 1
 
     # Patchify Image input, and then get BMU indices.
-    def get_patches_bmu(self, x):
+    def get_patches_bmu(self, x, reshape=False):
         x_patches = patchify(
             image=x,
             patch_dim=self.patch_dim)  # (N, Seq, D)
@@ -92,6 +92,10 @@ class Codebook(nn.Module):
             distances,
             dim=-1,
             keepdim=False)  # (N*Seq)
+
+        if reshape:
+            bmu_indices = bmu_indices.reshape(N, Seq)
+
         return bmu_indices
 
     # Compute discrete patches.
