@@ -96,6 +96,63 @@ def get_positional_embeddings(emb_dim, pos_index):
     return pos_emb
 
 
+# Layer to scale dimensions for Adaptive Layer Normalization - Zero.
+class ScaleLayer(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+
+        self.scale = nn.Linear(in_dim, out_dim)
+
+        # Initialize scale to zero for "zero" initialization.
+        nn.init.zeros_(self.scale.weight)
+
+    def forward(self, x):
+        scale = self.scale(x)
+        return scale
+
+
+# Layer to shift dimensions for Adaptive Layer Normalization - Zero.
+class ShiftLayer(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+
+        self.shift = nn.Linear(in_dim, out_dim)
+
+        # Initialize shift variable to zero for "zero" initialization.
+        nn.init.zeros_(self.shift.weight)
+
+    def forward(self, x):
+        shift = self.shift(x)
+        return shift
+
+
+# Adaptive LayerNorm-Zero: https://arxiv.org/abs/2212.09748
+class AdaLNZero(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+
+        # Layer Norm with learnable parameters (gamma and beta).
+        self.norm = nn.LayerNorm(
+            out_dim,
+            elementwise_affine=False)
+
+        self.scale_layer = ScaleLayer(
+            in_dim=in_dim,
+            out_dim=out_dim)
+        self.shift_layer = ShiftLayer(
+            in_dim=in_dim,
+            out_dim=out_dim)
+
+    def forward(self, x, cond):
+        x_norm = self.norm(x)
+
+        scale = self.scale_layer(cond)
+        shift = self.shift_layer(cond)
+
+        x_adaln0 = scale * x_norm + shift
+        return x_adaln0
+
+
 # Convolution Layer.
 class ConvLayer(nn.Module):
     def __init__(
@@ -204,8 +261,16 @@ class ResidualLinearLayer(nn.Module):
             in_dim=512,
             out_dim=512,
             skip_dim=512,
+            cond_dim=512,
+            use_scale_layer=False,
             activation_type="silu"):
         super().__init__()
+
+        self.use_scale_layer = use_scale_layer
+        if self.use_scale_layer:
+            self.scale_layer = ScaleLayer(
+                in_dim=cond_dim,
+                out_dim=in_dim)
 
         self.linear = LinearLayer(
             in_dim=in_dim,
@@ -223,7 +288,12 @@ class ResidualLinearLayer(nn.Module):
         self.activation = get_activation(
             activation_type=activation_type)
 
-    def forward(self, x, x_skip):
+    def forward(self, x, x_skip, cond=None):
+        # As described in DiT paper: https://arxiv.org/abs/2212.09748
+        if self.use_scale_layer:
+            x_scale = self.scale_layer(cond)
+            x = x * x_scale
+
         x = self.linear(x)
         x_skip = self.skip_linear(x_skip)
 
@@ -234,14 +304,27 @@ class ResidualLinearLayer(nn.Module):
         return x
 
 
-# Feedforward-Block: (Feedforward -> Norm -> Residual).
+# Feedforward-Block: (Norm -> Feedforward -> Residual).
 class FeedforwardBlock(nn.Module):
     def __init__(
             self,
             in_dim=512,
             hidden_dim=512,
+            cond_dim=512,
+            use_adaln0=False,
+            use_scale_layer=False,
             activation_type="silu"):
         super().__init__()
+
+        self.use_adaln0 = use_adaln0
+
+        # Feedforward Norm.
+        if self.use_adaln0:
+            self.feedforward_norm = AdaLNZero(
+                in_dim=cond_dim,
+                out_dim=in_dim)
+        else:
+            self.feedforward_norm = nn.LayerNorm(in_dim)
 
         # FeedForward Layer.
         self.feedforward = nn.Sequential(
@@ -255,21 +338,30 @@ class FeedforwardBlock(nn.Module):
                 out_dim=in_dim,
                 use_activation=True,
                 activation_type=activation_type))
-        self.feedforward_norm = nn.LayerNorm(in_dim)
+
+        # Feedforward Residual Layer.
         self.feedforward_res = ResidualLinearLayer(
             in_dim=in_dim,
             out_dim=in_dim,
             skip_dim=in_dim,
+            cond_dim=cond_dim,
+            use_scale_layer=use_scale_layer,
             activation_type=activation_type)
 
-    def forward(self, x):
+    def forward(self, x, cond=None):
         init_x = x
 
+        if self.use_adaln0:
+            x = self.feedforward_norm(
+                x,
+                cond=cond)
+        else:
+            x = self.feedforward_norm(x)
         x = self.feedforward(x)
-        x = self.feedforward_norm(x)
         x = self.feedforward_res(
             x=x,
-            x_skip=init_x)
+            x_skip=init_x,
+            cond=cond)
 
         return x
 
@@ -280,7 +372,7 @@ class AttentionLayer(nn.Module):
             self,
             heads=8,
             in_dim=512,
-            cond_dim=512,
+            cross_cond_dim=512,  # For Cross-Attention.
             hidden_dim=2_048,
             use_cross_attn=True,
             use_masked_attn=True,
@@ -292,7 +384,7 @@ class AttentionLayer(nn.Module):
         self.use_masked_attn = use_masked_attn
 
         if not self.use_cross_attn:
-            cond_dim = in_dim
+            cross_cond_dim = in_dim
 
         self.q_block = nn.Sequential(
             LinearLayer(
@@ -306,7 +398,7 @@ class AttentionLayer(nn.Module):
                 use_activation=False))
         self.k_block = nn.Sequential(
             LinearLayer(
-                in_dim=cond_dim,
+                in_dim=cross_cond_dim,
                 out_dim=hidden_dim,
                 use_activation=True,
                 activation_type=activation_type),
@@ -316,7 +408,7 @@ class AttentionLayer(nn.Module):
                 use_activation=False))
         self.v_block = nn.Sequential(
             LinearLayer(
-                in_dim=cond_dim,
+                in_dim=cross_cond_dim,
                 out_dim=hidden_dim,
                 use_activation=True,
                 activation_type=activation_type),
@@ -382,16 +474,30 @@ class AttentionLayer(nn.Module):
         return attention_out
 
 
-# Self-Attention Block: (Attn -> Norm -> Residual).
+# Self-Attention Block: (Norm -> Attn -> Residual).
 class SelfAttentionBlock(nn.Module):
     def __init__(
             self,
             heads=8,
             in_dim=512,
+            cond_dim=512,
             hidden_dim=512,
+            use_adaln0=False,
+            use_scale_layer=False,
             use_masked_attn=True,
             activation_type="silu"):
         super().__init__()
+
+        self.use_adaln0 = use_adaln0
+
+        # Self Attention Norm.
+        if self.use_adaln0:
+            self.self_attn_norm = AdaLNZero(
+                in_dim=cond_dim,
+                out_dim=in_dim)
+        else:
+            self.self_attn_norm = nn.LayerNorm(
+                in_dim)
 
         # Multi-Head Self Attention Layer.
         self.self_attn = AttentionLayer(
@@ -401,62 +507,94 @@ class SelfAttentionBlock(nn.Module):
             use_cross_attn=False,
             use_masked_attn=use_masked_attn,
             activation_type=activation_type)
-        self.self_attn_norm = nn.LayerNorm(
-            in_dim)
+
+        # Self Attention Residual Layer.
         self.self_attn_res = ResidualLinearLayer(
             in_dim=in_dim,
             out_dim=in_dim,
             skip_dim=in_dim,
+            cond_dim=cond_dim,
+            use_scale_layer=use_scale_layer,
             activation_type=activation_type)
 
-    def forward(self, x):
+    def forward(self, x, cond=None):
         init_x = x  # (N, Seq, D)
 
+        if self.use_adaln0:
+            x = self.self_attn_norm(
+                x,
+                cond=cond)
+        else:
+            x = self.self_attn_norm(x)
         x = self.self_attn(x)
-        x = self.self_attn_norm(x)
         x = self.self_attn_res(
             x=x,
-            x_skip=init_x)
+            x_skip=init_x,
+            cond=cond)
         return x
 
 
-# Cross-Attention Block: (Attn -> Norm -> Residual).
+# Cross-Attention Block: (Norm -> Attn -> Residual).
 class CrossAttentionBlock(nn.Module):
     def __init__(
             self,
             heads=8,
             in_dim=512,
             cond_dim=512,
+            cross_cond_dim=512,
             hidden_dim=512,
+            use_adaln0=False,
+            use_scale_layer=False,
             activation_type="silu"):
         super().__init__()
+
+        self.use_adaln0 = use_adaln0
+
+        # Cross Attention Norm.
+        if self.use_adaln0:
+            self.cross_attn_norm = AdaLNZero(
+                in_dim=cond_dim,
+                out_dim=in_dim)
+        else:
+            self.cross_attn_norm = nn.LayerNorm(
+                in_dim)
 
         # Multi-Head Cross Attention Layer.
         self.cross_attn = AttentionLayer(
             heads=heads,
             in_dim=in_dim,
-            cond_dim=cond_dim,
+            cross_cond_dim=cross_cond_dim,
             hidden_dim=hidden_dim,
             use_cross_attn=True,
             use_masked_attn=False,
             activation_type=activation_type)
-        self.cross_attn_norm = nn.LayerNorm(
-            in_dim)
+
+        # Cross-Attention Residual Layer.
         self.cross_attn_res = ResidualLinearLayer(
             in_dim=in_dim,
             out_dim=in_dim,
             skip_dim=in_dim,
+            cond_dim=cond_dim,
+            use_scale_layer=use_scale_layer,
             activation_type=activation_type)
 
-    def forward(self, x, cross_cond):
+    def forward(self, x, cross_cond, cond=None):
         init_x = x  # (N, Seq, D)
+
+        if self.use_adaln0:
+            x = self.cross_attn_norm(
+                x,
+                cond=cond)
+        else:
+            x = self.cross_attn_norm(x)
 
         x = self.cross_attn(
             x=x,
             cross_cond=cross_cond)
-        x = self.cross_attn_norm(x)
+
         x = self.cross_attn_res(
             x=x,
+            cond=cond,
             x_skip=init_x)
         return x
 
@@ -467,11 +605,14 @@ class TransformerBlock(nn.Module):
             self,
             in_dim=512,
             cond_dim=512,
+            cross_cond_dim=512,
             hidden_dim=512,
             self_attn_heads=8,
             cross_attn_heads=8,
             use_cross_attn=True,
             use_masked_attn=True,
+            use_adaln0=False,
+            use_scale_layer=False,
             activation_type="silu"):
         super().__init__()
 
@@ -480,27 +621,47 @@ class TransformerBlock(nn.Module):
         self.self_attn_block = SelfAttentionBlock(
             heads=self_attn_heads,
             in_dim=in_dim,
+            cond_dim=cond_dim,
             hidden_dim=hidden_dim,
+            use_adaln0=use_adaln0,
+            use_scale_layer=use_scale_layer,
             use_masked_attn=use_masked_attn,
             activation_type=activation_type)
+
         if self.use_cross_attn:
             self.cross_attn_block = CrossAttentionBlock(
                 heads=cross_attn_heads,
                 in_dim=in_dim,
                 cond_dim=cond_dim,
+                cross_cond_dim=cross_cond_dim,
                 hidden_dim=hidden_dim,
+                use_adaln0=use_adaln0,
+                use_scale_layer=use_scale_layer,
                 activation_type=activation_type)
+
         self.feedforward_block = FeedforwardBlock(
             in_dim=in_dim,
             hidden_dim=hidden_dim,
+            use_adaln0=use_adaln0,
+            cond_dim=cond_dim,
+            use_scale_layer=use_scale_layer,
             activation_type=activation_type)
 
-    def forward(self, x, cross_cond=None):
-        x = self.self_attn_block(x)
+    def forward(
+            self,
+            x,
+            cross_cond=None,
+            pos_cond=None):
+        x = self.self_attn_block(
+            x,
+            cond=pos_cond)
         if self.use_cross_attn:
             x = self.cross_attn_block(
                 x,
+                cond=pos_cond,
                 cross_cond=cross_cond)
-        x = self.feedforward_block(x)
+        x = self.feedforward_block(
+            x,
+            cond=pos_cond)
 
         return x
