@@ -25,6 +25,16 @@ from utils.model_utils import (
     load_model)
 from utils.image_utils import save_images
 
+def restricted_float(x):
+    try:
+        x = float(x)
+    except ValueError:
+        raise argparse.ArgumentTypeError("%r not a floating-point literal" % (x,))
+
+    if x < 0.1:
+        raise argparse.ArgumentTypeError("%r not in range > 0.1"%(x,))
+    return x
+
 def main():
     project_name = "Quantized Transformer"
 
@@ -43,6 +53,10 @@ def main():
         required=True,
         type=pathlib.Path)
     parser.add_argument(
+        "--train-base-model",
+        action='store_true',
+        help="Train Base Model, Decoder-only.")
+    parser.add_argument(
         "--decoder-path",
         help="File path to pre-trained decoder model.",
         required=True,
@@ -50,8 +64,7 @@ def main():
     parser.add_argument(
         "--lr-codebook-path",
         help="File path to saved Low-Res codebook.",
-        default=None,
-        required=False,
+        required=True,
         type=pathlib.Path)
     parser.add_argument(
         "--hr-codebook-path",
@@ -78,6 +91,11 @@ def main():
         help="Batch size for dataset.",
         type=int,
         default=8)
+    parser.add_argument(
+        "--temperature",
+        help="Temperature for softmax sampling.",
+        type=restricted_float,
+        default=1.0)
     parser.add_argument(
         "--checkpoint-step",
         help="Steps at which checkpoint takes place.",
@@ -112,8 +130,22 @@ def main():
         json_data = json_file.read()
     config_dict = json.loads(json_data)
 
+    """
+    Lower Temperature (T < 1):
+    Prioritizes the most probable next token and effectively reduces
+    randomness in the generated token.
+
+    Higher Temperature (T > 1):
+    Less probable tokens become more likely to be chosen, therefore more
+    diversity in generated token.
+
+    Can't be 0, OBVIOUSLY!!
+    """
+    temperature = args["temperature"]
+
     device = args["device"]  # Device to run model on.
     test_num_sample = args["test_num_sample"]
+    train_base_model = args["train_base_model"]  # Train Decoder-only Transformer.
     decoder_path = args["decoder_path"]
     lr_codebook_path = args["lr_codebook_path"]  # File path to Low-Res codebook.
     hr_codebook_path = args["hr_codebook_path"]  # File path to High-Res codebook.
@@ -170,29 +202,27 @@ def main():
         final_activation_type=dec_final_activation_type).to(device)
     decoder_model.custom_load_state_dict(decoder_model_dict["model"])
 
-    # Low - Resolution Codebook (If any passed).
-    lr_codebook = None
-    if lr_codebook_path is not None:
-        lr_codebook_status, lr_codebook_dict = load_model(lr_codebook_path)
-        if not lr_codebook_status:
-            raise Exception("An error occured while loading Low-Resolution codebook checkpoint!")
+    # Low - Resolution Codebook.
+    lr_codebook_status, lr_codebook_dict = load_model(lr_codebook_path)
+    if not lr_codebook_status:
+        raise Exception("An error occured while loading Low-Resolution codebook checkpoint!")
 
-        lr_patch_dim = lr_codebook_dict["patch_dim"]
-        lr_num_embeddings = lr_codebook_dict["num_embeddings"]
-        lr_image_dim = lr_codebook_dict["image_dim"]
-        lr_image_C = lr_codebook_dict["image_C"]
-        lr_neighbourhood_range = lr_codebook_dict["neighbourhood_range"]
+    lr_patch_dim = lr_codebook_dict["patch_dim"]
+    lr_num_embeddings = lr_codebook_dict["num_embeddings"]
+    lr_image_dim = lr_codebook_dict["image_dim"]
+    lr_image_C = lr_codebook_dict["image_C"]
+    lr_neighbourhood_range = lr_codebook_dict["neighbourhood_range"]
 
-        # Initialize Low-Resolution Codebook.
-        lr_codebook = Codebook(
-            patch_dim=lr_patch_dim,
-            image_dim=lr_image_dim,
-            image_channel=lr_image_C,
-            num_embeddings=lr_num_embeddings,
-            init_neighbour_range=lr_neighbourhood_range).to(device)
-        lr_codebook.custom_load_state_dict(lr_codebook_dict["checkpoint"])
+    # Initialize Low-Resolution Codebook.
+    lr_codebook = Codebook(
+        patch_dim=lr_patch_dim,
+        image_dim=lr_image_dim,
+        image_channel=lr_image_C,
+        num_embeddings=lr_num_embeddings,
+        init_neighbour_range=lr_neighbourhood_range).to(device)
+    lr_codebook.custom_load_state_dict(lr_codebook_dict["checkpoint"])
 
-    # High - Resolution Codebook (If Any).
+    # High - Resolution Codebook.
     hr_codebook_status, hr_codebook_dict = load_model(hr_codebook_path)
     if not hr_codebook_status:
         raise Exception("An error occured while loading Low-Resolution codebook checkpoint!")
@@ -214,31 +244,37 @@ def main():
 
     # Quantized Transformer Model Params.
     model_lr = config_dict["model_lr"]
-    use_encoder = config_dict["use_encoder"]
-    if use_encoder:
-        num_enc_embedding = lr_num_embeddings
-        num_enc_layers = config_dict["num_enc_layers"]
-    else:
+
+    if train_base_model:
+        # No Encoder layer in Transformer.
         num_enc_embedding = None
         num_enc_layers = None
+
+        # Combine LR codebook and HR codebook embeddings.
+        num_dec_embedding = lr_num_embeddings + hr_num_embeddings
+    else:
+        num_enc_embedding = lr_num_embeddings
+        num_enc_layers = config_dict["num_enc_layers"]
+
+        num_dec_embedding = hr_num_embeddings + 1  # Includes <start> token.
+    num_dec_layers = config_dict["num_dec_layers"]
+
     use_sliding_window = config_dict["use_sliding_window"]
 
     sliding_window = None
     if use_sliding_window:
         sliding_window = config_dict["sliding_window"]
 
-    num_dec_embedding = hr_num_embeddings
-    num_dec_layers = config_dict["num_dec_layers"]
     self_attn_heads = config_dict["self_attn_heads"]
     cross_attn_heads = config_dict["cross_attn_heads"]
     transformer_in_dim = config_dict["in_dim"]
-    transformer_out_dim = hr_num_embeddings
+    transformer_out_dim = hr_num_embeddings + 1  # Includes <end> token.
     transformer_hidden_dim = config_dict["hidden_dim"]
     hidden_activation = config_dict["hidden_activation"]
 
     # Transformer model, to be trained.
     model = Transformer(
-        use_encoder=use_encoder,
+        use_encoder=not train_base_model,
         use_pos_cond=use_sliding_window,
         num_enc_layers=num_enc_layers,
         num_dec_layers=num_dec_layers,
@@ -271,7 +307,7 @@ def main():
             for model_optim_ in model_optim.param_groups:
                 model_optim_["lr"] = model_lr
 
-    # Cross Entropy Loss, ignores pad token.
+    # Cross Entropy Loss.
     ce_loss = nn.CrossEntropyLoss()
 
     # Feature Map Dataset.
@@ -284,12 +320,11 @@ def main():
         batch_size=batch_size,
         num_workers=4,
         shuffle=True)
-    if use_encoder:
-        test_feature_map_dataloader = torch.utils.data.DataLoader(
-            feature_map_dataset,
-            batch_size=test_num_sample,
-            num_workers=4,
-            shuffle=True)
+    test_feature_map_dataloader = torch.utils.data.DataLoader(
+        feature_map_dataset,
+        batch_size=test_num_sample,
+        num_workers=2,
+        shuffle=True)
 
     model_params_size = sum(param.numel() for param in model.parameters())
 
@@ -307,18 +342,16 @@ def main():
     logging.info(f"Decoder activation type: {dec_final_activation_type}")
     logging.info("#" * 100)
     logging.info(f"Codebook Parameters.")
-    if lr_codebook is not None:
-        logging.info(f"Low Res Patch size: {lr_patch_dim}")
-        logging.info(f"Low Res Num Embeddings: {lr_num_embeddings:,}")
+    logging.info(f"Low Res Patch size: {lr_patch_dim}")
+    logging.info(f"Low Res Num Embeddings: {lr_num_embeddings:,}")
     logging.info(f"High Res Patch size: {hr_patch_dim}")
     logging.info(f"High Res Num Embeddings: {hr_num_embeddings:,}")
     logging.info("#" * 100)
     logging.info(f"Transformer Parameters.")
     if use_sliding_window:
         logging.info(f"Sliding Window: {sliding_window:,}")
-    if use_encoder:
-        logging.info(f"Num Encoder Embedding: {num_enc_embedding:,}")
-        logging.info(f"Num Encoder Layers: {num_enc_layers:,}")
+    logging.info(f"Num Encoder Embedding: {num_enc_embedding}")
+    logging.info(f"Num Encoder Layers: {num_enc_layers}")
     logging.info(f"Num Decoder Embedding: {num_dec_embedding:,}")
     logging.info(f"Num Decoder Layers: {num_dec_layers:,}")
     logging.info(f"Self Attention Heads: {self_attn_heads:,}")
@@ -334,6 +367,9 @@ def main():
     logging.info(f"Model LR Update size: {lr_update_step:,}")
     logging.info(f"Model Checkpoint step: {model_checkpoint_step:,}")
     logging.info("#" * 100)
+    logging.info(f"Sampling Parameters.")
+    logging.info(f"Temperature: {temperature:,}")
+    logging.info("#" * 100)
 
     for epoch in range(curr_epoch, max_epoch):
         total_loss = 0
@@ -344,30 +380,46 @@ def main():
 
             feature_map = feature_map.to(device)
 
-            lr_input = None
-            if lr_codebook is not None:
-                lr_codebook.eval()
-                lr_input = lr_codebook.get_patches_bmu(
-                    feature_map,
-                    reshape=True)  # (N, lr_Seq)
+            N, _, _, _ = feature_map.shape
 
+            # Indices from Low-Resolution Codebook.
+            lr_codebook.eval()
+            lr_indices = lr_codebook.get_patches_bmu(
+                feature_map,
+                reshape=True)  # (N, lr_Seq)
+
+            # Indices from High-Resolution Codebook.
             hr_codebook.eval()
             hr_indices = hr_codebook.get_patches_bmu(
                 feature_map,
                 reshape=True)  # (N, hr_Seq)
 
-            N, total_Seq = hr_indices.shape
+            if train_base_model:
+                # Shift High-Resolution indices to account for combined Embeddings.
+                hr_indices_shifted = hr_indices + lr_num_embeddings
 
-            # Add <start> token.
-            start_tensor = torch.tensor(
-                [[hr_num_embeddings]],
-                device=device).repeat(N, 1)
-            hr_input = torch.cat(
-                (start_tensor,hr_indices),
-                dim=1)
+                # Combined HR and LR indices, with LR acting like <start> token.
+                hr_input = torch.cat(
+                    (lr_indices,hr_indices_shifted),
+                    dim=1)
+
+                # No Low-Res indices.
+                lr_input = None
+            else:
+                # Generate <start> token to be added at the beginning.
+                start_tensor = torch.tensor(
+                    [[hr_num_embeddings]],
+                    device=device).repeat(N, 1)
+                hr_input = torch.cat(
+                    (start_tensor,hr_indices),
+                    dim=1)
+
+                # Low-Resolution input for Encoder layer.
+                lr_input = lr_indices.to(device)
+
             hr_input = hr_input.to(device)
 
-            # Add <end> token.
+            # Generate <end> token to be added at the end.
             end_tensor = torch.tensor(
                 [[hr_num_embeddings]],
                 device=device).repeat(N, 1)
@@ -376,9 +428,10 @@ def main():
                 dim=1)
             hr_target = hr_target.to(device)
 
+            # In cases where HR input is too large for memory, use sliding window.
             sliding_window_indices = None
             if use_sliding_window:
-                # Generate all the possible sections of the sliding window.
+                # Generate all the possible values of the sliding window.
                 hr_input_unfold = hr_input.unfold(
                     dimension=1,
                     size=sliding_window,
@@ -398,13 +451,13 @@ def main():
                 hr_input = hr_input_unfold[torch.arange(N), rand_indices, :]  # (N, D)
                 hr_target = hr_target_unfold[torch.arange(N), rand_indices, :]  # (N, D)
 
+                # Indices of sliding window to be used as conditional information
                 sliding_window_indices = rand_indices.unsqueeze(dim=1) +\
                  torch.arange(sliding_window).unsqueeze(dim=0)  # (N, Window)
 
                 sliding_window_indices = sliding_window_indices.to(device)
 
             model.train()
-
             model_optim.zero_grad()
 
             classification_out = model(
@@ -412,6 +465,7 @@ def main():
                 x_enc=lr_input,
                 pos_cond=sliding_window_indices)
 
+            # Flatten dimensions for loss.
             _, Seq, C = classification_out.shape            
             out_seq_flat = classification_out.view(N*Seq, C)  # (N*Seq, Class)
             target_seq_flat = hr_target.flatten()  # (N*Seq,)
@@ -419,7 +473,6 @@ def main():
             loss = ce_loss(
                 out_seq_flat,
                 target_seq_flat)
-
             if torch.isnan(loss):
                 raise Exception("NaN encountered during training.")
 
@@ -433,11 +486,11 @@ def main():
                 for model_optim_ in model_optim.param_groups:
                     model_optim_['lr'] = model_optim_['lr'] * 0.5
 
-            # Checkpoint and Plot Images.
+            # Checkpoint models and synthesis images.
             if global_steps % model_checkpoint_step == 0 and global_steps >= 0:
-                # Save diffusion models, and optimizers.
+                # Save models, and optimizers.
                 model_dict = {
-                    "use_encoder": use_encoder,
+                    "train_base_model": train_base_model,
                     "use_sliding_window": use_sliding_window,
                     "sliding_window": sliding_window,
                     "num_enc_embedding": num_enc_embedding,
@@ -462,79 +515,67 @@ def main():
                     logging.info("Successfully saved model.")
                 else:
                     logging.info("Error occured saving model.")
-
+                
                 # Autoregressively generate image one token at a time.
-                """
-                Lower Temperature (T < 1):
-                Prioritizes the most probable next token and effectively reduces
-                randomness in the generated token.
-
-                Higher Temperature (T > 1):
-                Less probable tokens become more likely to be chosen, therefore more
-                diversity in generated token.
-
-                Can't be 0, OBVIOUSLY!!
-                """
-                temperature = 1.0  # Hardcoded to 1 for now.
-
-                if lr_codebook is not None:
-                    lr_codebook.eval()
-
                 model.eval()
+                lr_codebook.eval()
                 hr_codebook.eval()
                 decoder_model.eval()
 
+                _, total_Seq = hr_input.shape
+                total_Seq = total_Seq - 1
+
                 with torch.no_grad():
-                    test_lr_input = None
-                    test_hr_input_example = None
+                    test_feature_map = next(iter(test_feature_map_dataloader))
+                    test_feature_map = test_feature_map.to(device)
 
-                    if use_encoder:
-                        test_feature_map = next(iter(test_feature_map_dataloader))
-                        test_feature_map = test_feature_map.to(device)
+                    latent_decoder = decoder_model(test_feature_map)
 
-                        test_lr_input = lr_codebook.get_patches_bmu(
-                            test_feature_map,
-                            reshape=True)
+                    test_hr_quant = hr_codebook(test_feature_map)
+                    test_lr_quant = lr_codebook(test_feature_map)
 
-                        latent_decoder = decoder_model(test_feature_map)
+                    hr_decoder = decoder_model(test_hr_quant)
+                    lr_decoder = decoder_model(test_lr_quant)
 
-                        test_hr_quant = hr_codebook(test_feature_map)
-                        test_lr_quant = lr_codebook(test_feature_map)
-
-                        hr_decoder = decoder_model(test_hr_quant)
-                        lr_decoder = decoder_model(test_lr_quant)
-
-                        # Save Images.
-                        _ = save_images(
-                            images=latent_decoder,
-                            file_name=f"ground_truth_{global_steps}",
-                            dest_path=out_dir,
-                            logging=logging.info)
-                        _ = save_images(
-                            images=lr_decoder,
-                            file_name=f"low_res_cond_{global_steps}",
-                            dest_path=out_dir,
-                            logging=logging.info)
-                        _ = save_images(
-                            images=hr_decoder,
-                            file_name=f"high_res_example_{global_steps}",
-                            dest_path=out_dir,
-                            logging=logging.info)
-
-                        test_lr_indices = lr_codebook.get_patches_bmu(
-                            test_feature_map,
-                            reshape=True)  # (N, Seq)
-                        test_hr_indices = hr_codebook.get_patches_bmu(
-                            test_feature_map,
-                            reshape=True)  # (N, Seq)
+                    # Save Images.
+                    _ = save_images(
+                        images=latent_decoder,
+                        file_name=f"ground_truth_{global_steps}",
+                        dest_path=out_dir,
+                        logging=logging.info)
+                    _ = save_images(
+                        images=lr_decoder,
+                        file_name=f"low_res_cond_{global_steps}",
+                        dest_path=out_dir,
+                        logging=logging.info)
+                    _ = save_images(
+                        images=hr_decoder,
+                        file_name=f"high_res_example_{global_steps}",
+                        dest_path=out_dir,
+                        logging=logging.info)
 
                     start_index = 0
 
-                    # Add <start> token.
-                    test_hr_input = torch.tensor(
-                        [[hr_num_embeddings]],
-                        device=device).repeat(test_num_sample,1)  # (test_N,1)
+                    if train_base_model:
+                        # No Encoder layer input.
+                        test_lr_input = None
 
+                        # Set low-resolution as the first token.
+                        test_hr_input = lr_codebook.get_patches_bmu(
+                            test_feature_map,
+                            reshape=True)  # (N, lr_Seq)
+                    else:
+                        # Conditional input for Encoder layer.
+                        test_lr_input = lr_codebook.get_patches_bmu(
+                            test_feature_map,
+                            reshape=True)  # (N, lr_Seq)
+
+                        # Set <start> tokenas the first token.
+                        test_hr_input = torch.tensor(
+                            [[hr_num_embeddings]],
+                            device=device).repeat(test_num_sample,1)  # (test_N,1)
+
+                    # Conditional information, where sliding window is used.
                     test_pos_indices = None
                     if use_sliding_window:
                         # Initial Position indices, starts at 0.
@@ -542,22 +583,23 @@ def main():
                             (test_num_sample,1),
                             device=device)  # (test_N,1)
 
-                    # TODO: Implement a Beam Search to improve output quality.
                     for step in range(total_Seq):
-                        print(f"{step:,} / {total_Seq:,}")
+                        print(f"{step + 1:,} / {total_Seq:,}")
 
-                        _, temp_Seq = test_hr_input.shape
-                        if temp_Seq >= sliding_window:
-                            start_index = start_index + 1
+                        # Update sliding window indices and data when filled up.
+                        if use_sliding_window:
+                            _, temp_Seq = test_hr_input.shape
+                            if temp_Seq >= sliding_window:
+                                start_index = start_index + 1
+                                test_pos_indices = test_pos_indices[:, 1:]
 
-                            test_pos_indices = test_pos_indices[:, 1:]
-
+                        test_hr_window = test_hr_input[:,start_index:]
                         out_seq = model(
-                            x_dec=test_hr_input[:,start_index:],
+                            x_dec=test_hr_window,
                             x_enc=test_lr_input,
                             pos_cond=test_pos_indices)
 
-                        # Take the last prediction as the next-token.
+                        # Pick the last sequence.
                         out_seq = out_seq[:, -1, :]  # (N, Class)
 
                         probs = F.softmax(out_seq / temperature, dim=1)  # (N, Class)
@@ -565,9 +607,14 @@ def main():
                         # Pick most likely token for next generation for each Token Sequence (Seq).
                         next_token = torch.multinomial(probs, 1)
 
+                        if train_base_model:
+                            # Shift indices to appropriate range of values.
+                            next_token = next_token + lr_num_embeddings
+
                         test_hr_input = torch.cat(
                             (test_hr_input,next_token),
                             dim=1)
+
                         if use_sliding_window:
                             temp_indices = torch.tensor(
                                 [[step + 1]],
@@ -576,8 +623,12 @@ def main():
                                 (test_pos_indices, temp_indices),
                                 dim=1)
 
-                    test_hr_input = test_hr_input[:,1:]
-                    test_hr_input[test_hr_input==hr_num_embeddings] = 0
+                    test_hr_input = test_hr_input[:,1:]  # Skip first token.
+                    if train_base_model:
+                        test_hr_input = test_hr_input - lr_num_embeddings  # Revert to proper index.
+                        test_hr_input[test_hr_input==hr_num_embeddings] = lr_num_embeddings  # In cases where <end> token is predicted.
+                    else:
+                        test_hr_input[test_hr_input==hr_num_embeddings] = 0  # In cases where <end> token is predicted.
 
                     test_hr_quant = hr_codebook.get_quantized_image(
                         indices=test_hr_input,

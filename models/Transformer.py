@@ -51,7 +51,7 @@ class Transformer(nn.Module):
                         activation_type=hidden_activation))
 
         self.dec_embedding = nn.Embedding(
-            num_embeddings=num_dec_embedding + 1,  # Includes <Start> Token.
+            num_embeddings=num_dec_embedding,
             embedding_dim=transformer_in_dim)
 
         # Diffusion Transformer Architecture.
@@ -65,7 +65,7 @@ class Transformer(nn.Module):
                     hidden_dim=transformer_hidden_dim,
                     self_attn_heads=self_attn_heads,
                     cross_attn_heads=cross_attn_heads,
-                    use_cross_attn=True,
+                    use_cross_attn=self.use_encoder,
                     use_masked_attn=True,
                     use_adaln0=self.use_pos_cond,
                     use_scale_layer=self.use_pos_cond,
@@ -92,7 +92,7 @@ class Transformer(nn.Module):
                 use_activation=True),
             LinearLayer(
                 in_dim=transformer_hidden_dim,
-                out_dim=transformer_out_dim + 1,
+                out_dim=transformer_out_dim,
                 use_activation=False))
 
     def custom_load_state_dict(self, state_dict):
