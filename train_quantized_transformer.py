@@ -233,6 +233,13 @@ def main():
     hr_image_C = hr_codebook_dict["image_C"]
     hr_neighbourhood_range = hr_codebook_dict["neighbourhood_range"]
 
+    # Total number of sequence passed in Decoder.
+    img_H, img_W = hr_image_dim
+    hr_patch_H, hr_patch_W = hr_patch_dim
+    total_hr_Seq = (
+        img_H // hr_patch_H) * (
+            img_W // hr_patch_W)
+
     # Initialize Low-Resolution Codebook.
     hr_codebook = Codebook(
         patch_dim=hr_patch_dim,
@@ -246,27 +253,40 @@ def main():
     model_lr = config_dict["model_lr"]
 
     if train_base_model:
-        # No Encoder layer in Transformer.
-        num_enc_embedding = None
+        # No Encoder Layer(s) Params.
         num_enc_layers = None
+        num_enc_embedding = None
+
+        # No Cross-Attention.
+        cross_attn_heads = None
 
         # Combine LR codebook and HR codebook embeddings.
         num_dec_embedding = lr_num_embeddings + hr_num_embeddings
     else:
+        # Encoder Layer(s) Params.
         num_enc_embedding = lr_num_embeddings
         num_enc_layers = config_dict["num_enc_layers"]
 
+        # Number of Cross-Attention heads.
+        cross_attn_heads = config_dict["cross_attn_heads"]
+
+        # HR Codebook embeddings for Decoder.
         num_dec_embedding = hr_num_embeddings + 1  # Includes <start> token.
+
+    # Number of Decoder layers
     num_dec_layers = config_dict["num_dec_layers"]
 
+    # Sliding Window Params.
     use_sliding_window = config_dict["use_sliding_window"]
-
-    sliding_window = None
     if use_sliding_window:
         sliding_window = config_dict["sliding_window"]
+    else:
+        sliding_window = None
 
+    # Number of Self-Attention heads.
     self_attn_heads = config_dict["self_attn_heads"]
-    cross_attn_heads = config_dict["cross_attn_heads"]
+
+    # Transformer model Params.
     transformer_in_dim = config_dict["in_dim"]
     transformer_out_dim = hr_num_embeddings + 1  # Includes <end> token.
     transformer_hidden_dim = config_dict["hidden_dim"]
@@ -355,7 +375,7 @@ def main():
     logging.info(f"Num Decoder Embedding: {num_dec_embedding:,}")
     logging.info(f"Num Decoder Layers: {num_dec_layers:,}")
     logging.info(f"Self Attention Heads: {self_attn_heads:,}")
-    logging.info(f"Cross Attention Heads: {cross_attn_heads:,}")
+    logging.info(f"Cross Attention Heads: {cross_attn_heads}")
     logging.info(f"In Dim: {transformer_in_dim:,}")
     logging.info(f"Out Dim: {transformer_out_dim:,}")
     logging.info(f"Hidden Dim: {transformer_hidden_dim:,}")
@@ -458,6 +478,7 @@ def main():
                 sliding_window_indices = sliding_window_indices.to(device)
 
             model.train()
+
             model_optim.zero_grad()
 
             classification_out = model(
@@ -515,15 +536,12 @@ def main():
                     logging.info("Successfully saved model.")
                 else:
                     logging.info("Error occured saving model.")
-                
+
                 # Autoregressively generate image one token at a time.
                 model.eval()
                 lr_codebook.eval()
                 hr_codebook.eval()
                 decoder_model.eval()
-
-                _, total_Seq = hr_input.shape
-                total_Seq = total_Seq - 1
 
                 with torch.no_grad():
                     test_feature_map = next(iter(test_feature_map_dataloader))
@@ -583,10 +601,10 @@ def main():
                             (test_num_sample,1),
                             device=device)  # (test_N,1)
 
-                    for step in range(total_Seq):
-                        print(f"{step + 1:,} / {total_Seq:,}")
+                    for step in range(total_hr_Seq):
+                        print(f"{step + 1:,} / {total_hr_Seq:,}")
 
-                        # Update sliding window indices and data when filled up.
+                        # Update sliding window indices and data once filled up.
                         if use_sliding_window:
                             _, temp_Seq = test_hr_input.shape
                             if temp_Seq >= sliding_window:
@@ -594,6 +612,7 @@ def main():
                                 test_pos_indices = test_pos_indices[:, 1:]
 
                         test_hr_window = test_hr_input[:,start_index:]
+
                         out_seq = model(
                             x_dec=test_hr_window,
                             x_enc=test_lr_input,
@@ -607,15 +626,20 @@ def main():
                         # Pick most likely token for next generation for each Token Sequence (Seq).
                         next_token = torch.multinomial(probs, 1)
 
+                        # HACK: Replace end token prediction(s) with default 0 index.
+                        next_token[next_token==hr_num_embeddings] = 0
+
                         if train_base_model:
                             # Shift indices to appropriate range of values.
                             next_token = next_token + lr_num_embeddings
 
+                        # Append next token to original input.
                         test_hr_input = torch.cat(
                             (test_hr_input,next_token),
                             dim=1)
 
                         if use_sliding_window:
+                            # Append next position indices.
                             temp_indices = torch.tensor(
                                 [[step + 1]],
                                 device=device).repeat(test_num_sample, 1)
