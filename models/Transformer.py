@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 
+from torch.utils import checkpoint
+
 from .layers import (
     LinearLayer,
     TransformerBlock,
@@ -25,11 +27,15 @@ class Transformer(nn.Module):
             transformer_in_dim=512,
             transformer_out_dim=512,
             transformer_hidden_dim=4096,
-            hidden_activation="silu"):
+            hidden_activation="silu",
+            use_activation_checkpoint=False):
         super().__init__()
 
         self.use_encoder = use_encoder
         self.use_pos_cond = use_pos_cond
+
+        # More info. here: https://pytorch.org/docs/stable/checkpoint.html
+        self.use_activation_checkpoint = use_activation_checkpoint
 
         if self.use_encoder:
             self.enc_embedding = nn.Embedding(
@@ -133,7 +139,13 @@ class Transformer(nn.Module):
             x_enc = x_enc + enc_pos_emb
 
             for encoder_layer in self.encoder_layers:
-                x_enc = encoder_layer(x_enc)
+                if self.use_activation_checkpoint:
+                    x_enc = checkpoint.checkpoint(
+                        encoder_layer,
+                        x_enc,
+                        use_reentrant=False)
+                else:
+                    x_enc = encoder_layer(x_enc)
 
         """
         Decoder Half.
@@ -165,10 +177,26 @@ class Transformer(nn.Module):
             pos_cond_emb = self.pos_cond_layer(pos_cond_emb)  # (N, Seq, D)
 
         for decoder_layer in self.decoder_layers:
-            x_dec = decoder_layer(
-                x=x_dec,
-                cross_cond=x_enc,
-                pos_cond=pos_cond_emb)
+            if self.use_activation_checkpoint:
+                x_dec = checkpoint.checkpoint(
+                    decoder_layer,
+                    x_dec,
+                    cross_cond=x_enc,
+                    pos_cond=pos_cond_emb,
+                    use_reentrant=False)
+            else:
+                x_dec = decoder_layer(
+                    x=x_dec,
+                    cross_cond=x_enc,
+                    pos_cond=pos_cond_emb)
 
-        x_class = self.classifier(x_dec)
+        if self.use_activation_checkpoint:
+            x_class = checkpoint.checkpoint_sequential(
+                self.classifier,
+                segments=2,
+                input=x_dec,
+                use_reentrant=False)
+        else:
+            x_class = self.classifier(x_dec)
+
         return x_class

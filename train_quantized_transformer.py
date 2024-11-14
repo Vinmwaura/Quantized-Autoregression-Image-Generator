@@ -112,6 +112,10 @@ def main():
         type=int,
         default=1_000)
     parser.add_argument(
+        "--use-activation-checkpoint",
+        action='store_true',
+        help="Use Activation Checkpointing; trade-off memory footprint and compute.")
+    parser.add_argument(
         "--config-path",
         help="File path to load json config file.",
         required=True,
@@ -144,6 +148,7 @@ def main():
     temperature = args["temperature"]
 
     device = args["device"]  # Device to run model on.
+    use_activation_checkpoint = args["use_activation_checkpoint"]
     test_num_sample = args["test_num_sample"]
     train_base_model = args["train_base_model"]  # Train Decoder-only Transformer.
     decoder_path = args["decoder_path"]
@@ -305,7 +310,8 @@ def main():
         transformer_in_dim=transformer_in_dim,
         transformer_out_dim=transformer_out_dim,
         transformer_hidden_dim=transformer_hidden_dim,
-        hidden_activation=hidden_activation)
+        hidden_activation=hidden_activation,
+        use_activation_checkpoint=use_activation_checkpoint)
 
     model = model.to(device)
     model_optim = torch.optim.Adam(
@@ -588,7 +594,7 @@ def main():
                             test_feature_map,
                             reshape=True)  # (N, lr_Seq)
 
-                        # Set <start> tokenas the first token.
+                        # Set <start> tokens the first token.
                         test_hr_input = torch.tensor(
                             [[hr_num_embeddings]],
                             device=device).repeat(test_num_sample,1)  # (test_N,1)
