@@ -37,6 +37,11 @@ def main():
         type=int,
         default=25)
     parser.add_argument(
+        "--seed",
+        help="Seed value.",
+        type=int,
+        default=None)
+    parser.add_argument(
         "--config-path",
         help="File path to load json config file.",
         required=True,
@@ -50,6 +55,7 @@ def main():
     args = vars(parser.parse_args())
 
     device = args["device"]  # Device to run model on.
+    seed = args["seed"]
     decoder_path = args["decoder_path"]  #  Pre-trained decoder model path.
     num_images = args["num_images"]  # Number of images to generate.
     out_dir = args["out_dir"]  # Output Directory.
@@ -57,6 +63,9 @@ def main():
         os.makedirs(out_dir, exist_ok=True)
     except Exception as e:
         raise e
+
+    if seed is not None:
+        torch.manual_seed(seed)
 
     # Load and Parse config JSON.
     config_json = args["config_path"]
