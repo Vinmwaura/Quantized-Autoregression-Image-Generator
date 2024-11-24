@@ -1,0 +1,3 @@
+numpy==1.26.4
+tinydb==4.8.0
+opencv-python==4.10.0.84
