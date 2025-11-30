@@ -71,6 +71,9 @@ I was able to train a model using [Danbooru2017](https://gwern.net/danbooru2021#
     ```
 
 ## Training Model(s)
+### Models and Codebooks
+Model weights and codebook for the project can be found [here](https://huggingface.co/VinML/Quantized-Autoregression-Image-Generator-Models)
+
 ### Autoencoder
 Ensure there's a dataset.json file for the dataset that looks like this:
 ```
